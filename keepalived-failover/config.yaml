@@ -1,0 +1,63 @@
+name: "Keepalived HA Failover"
+version: "1.0.0"
+slug: "keepalived_failover"
+description: "Gestione automatica failover IP tra due nodi Home Assistant con VRRP"
+url: "https://github.com/tuo-username/ha-keepalived-failover"
+arch:
+  - aarch64
+  - armhf
+  - armv7
+  - amd64
+  - i386
+
+init: false
+startup: services
+boot: auto
+watchdog: true
+
+network_mode: host
+
+privileged:
+  - NET_ADMIN
+  - NET_RAW
+  - SYS_ADMIN
+
+devices:
+  - /dev/net/tun
+
+volumes:
+  - /etc/keepalived:/etc/keepalived:rw
+  - /var/run/keepalived:/var/run/keepalived:rw
+
+host_network: true
+host_dbus: true
+
+options:
+  node_role: "auto"
+  virtual_ip: "10.14.0.250"
+  master_node_ip: "10.14.0.237"
+  slave_node_ip: "10.14.0.245"
+  vrid: 51
+  password: "haus3r2026"
+  priority_master: 150
+  priority_backup: 90
+  advert_interval: 1
+  check_interval: 5
+  ha_port: 8123
+  interface: "eth0"
+  enable_preempt: true
+
+schema:
+  node_role: "list(auto|master|backup)"
+  virtual_ip: "str"
+  master_node_ip: "str"
+  slave_node_ip: "str"
+  vrid: "int(1,255)"
+  password: "str"
+  priority_master: "int(1,255)"
+  priority_backup: "int(1,255)"
+  advert_interval: "int(1,10)"
+  check_interval: "int(3,60)"
+  ha_port: "port"
+  interface: "str"
+  enable_preempt: "bool"
