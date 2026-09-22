@@ -1,5 +1,5 @@
 name: "Keepalived HA Failover"
-version: "0.1.5"
+version: "0.1.6"
 slug: "keepalived_failover"
 description: "Failover VRRP con IP virtuale tra due nodi Home Assistant"
 url: "https://github.com/mirkoa82/ha-keepalived-failover"
