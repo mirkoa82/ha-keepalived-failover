@@ -34,7 +34,24 @@ else
     exit 1
 fi
 
-bashio::log.info "Test rilevamento completato. Nessuna modifica di rete applicata."
+CAP_EFF_HEX="$(awk '/CapEff/ { print $2 }' /proc/self/status)"
+CAP_EFF_DEC=$((16#${CAP_EFF_HEX}))
+
+bashio::log.info "Capability effettive del container (CapEff): ${CAP_EFF_HEX}"
+
+if (( (CAP_EFF_DEC & (1 << 12)) != 0 )); then
+    bashio::log.info "CAP_NET_ADMIN presente."
+else
+    bashio::log.warning "CAP_NET_ADMIN NON presente."
+fi
+
+if (( (CAP_EFF_DEC & (1 << 13)) != 0 )); then
+    bashio::log.info "CAP_NET_RAW presente."
+else
+    bashio::log.warning "CAP_NET_RAW NON presente."
+fi
+
+bashio::log.info "Test completato: nessuna modifica di rete applicata."
 
 while true; do
     sleep 3600
