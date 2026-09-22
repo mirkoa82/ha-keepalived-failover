@@ -1,7 +1,7 @@
 name: "Keepalived HA Failover"
-version: "0.1.3"
+version: "0.1.5"
 slug: "keepalived_failover"
-description: "Gestione failover VRRP tra due nodi Home Assistant"
+description: "Failover VRRP con IP virtuale tra due nodi Home Assistant"
 url: "https://github.com/mirkoa82/ha-keepalived-failover"
 arch:
   - aarch64
@@ -15,18 +15,36 @@ host_network: true
 
 options:
   node_role: "backup"
-  virtual_ip: "10.14.0.250"
+  virtual_ip: "10.14.0.246"
+  prefix_length: 24
   master_node_ip: "10.14.0.237"
   backup_node_ip: "10.14.0.245"
-  interface: "eth0"
   vrid: 51
   vrrp_password: "cambiare123"
+  priority_master: 150
+  priority_backup: 100
+  advert_interval: 1
+  preempt: true
+  health_check_enabled: true
+  health_check_interval: 5
+  health_check_failures: 3
+  core_start_timeout: 180
+  stop_core_when_backup: false
 
 schema:
   node_role: "list(master|backup)"
   virtual_ip: "str"
+  prefix_length: "int(1,32)"
   master_node_ip: "str"
   backup_node_ip: "str"
-  interface: "str"
   vrid: "int(1,255)"
   vrrp_password: "str"
+  priority_master: "int(1,255)"
+  priority_backup: "int(1,255)"
+  advert_interval: "int(1,10)"
+  preempt: "bool"
+  health_check_enabled: "bool"
+  health_check_interval: "int(1,60)"
+  health_check_failures: "int(1,10)"
+  core_start_timeout: "int(30,600)"
+  stop_core_when_backup: "bool"
