@@ -1,50 +1,61 @@
-name: "Keepalived HA Failover"
-version: "0.1.7"
-slug: "keepalived_failover"
-description: "Failover VRRP con IP virtuale tra due nodi Home Assistant"
-url: "https://github.com/mirkoa82/ha-keepalived-failover"
+name: "HA Failover Addon"
+version: "1.0.0"
+slug: "ha_failover_addon"
+description: "Add-on per failover HA con VRRP o modalità Supervisor (solo Raspberry)"
 arch:
-  - aarch64
   - armv7
+  - aarch64
   - amd64
-
 init: false
 startup: services
 boot: auto
+hassio_api: true
+hassio_role: manager
 host_network: true
-
+privileged:
+  - NET_ADMIN
+  - SYS_ADMIN
+ports:
+  8123/tcp: 8123
 options:
-  node_role: "backup"
-  virtual_ip: "10.14.0.246"
+  node_role: master
+  virtual_ip: 10.14.0.246
   prefix_length: 24
-  master_node_ip: "10.14.0.237"
-  backup_node_ip: "10.14.0.245"
+  master_node_ip: 10.14.0.237
+  backup_node_ip: 10.14.0.245
   vrid: 51
-  vrrp_password: "cambiare123"
+  vrrp_password: cambiare123
   priority_master: 150
   priority_backup: 100
-  advert_interval: 1
-  preempt: true
-  health_check_enabled: true
-  health_check_interval: 5
-  health_check_failures: 3
+  operational_mode: supervisor
+  check_interval: 5
+  failover_failures: 6
+  failover_grace_period: 30
+  failback_successes: 24
+  failback_grace_period: 30
+  tcp_timeout: 3
   core_start_timeout: 180
-  stop_core_when_backup: false
-
+  core_stop_timeout: 60
+  post_vip_add_delay: 5
+  post_vip_remove_delay: 5
 schema:
-  node_role: "list(master|backup)"
-  virtual_ip: "str"
-  prefix_length: "int(1,32)"
-  master_node_ip: "str"
-  backup_node_ip: "str"
-  vrid: "int(1,255)"
-  vrrp_password: "str"
-  priority_master: "int(1,255)"
-  priority_backup: "int(1,255)"
-  advert_interval: "int(1,10)"
-  preempt: "bool"
-  health_check_enabled: "bool"
-  health_check_interval: "int(1,60)"
-  health_check_failures: "int(1,10)"
-  core_start_timeout: "int(30,600)"
-  stop_core_when_backup: "bool"
+  node_role: list(master|backup)
+  virtual_ip: str
+  prefix_length: int
+  master_node_ip: str
+  backup_node_ip: str
+  vrid: int(1,255)
+  vrrp_password: str
+  priority_master: int(1,254)
+  priority_backup: int(1,254)
+  operational_mode: list(vrrp|supervisor)
+  check_interval: int(1,60)
+  failover_failures: int(1,60)
+  failover_grace_period: int(0,300)
+  failback_successes: int(1,120)
+  failback_grace_period: int(0,300)
+  tcp_timeout: int(1,30)
+  core_start_timeout: int(10,600)
+  core_stop_timeout: int(10,300)
+  post_vip_add_delay: int(0,60)
+  post_vip_remove_delay: int(0,60)
