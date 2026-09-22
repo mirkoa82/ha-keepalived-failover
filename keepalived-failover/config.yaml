@@ -1,6 +1,6 @@
-name: "HA Failover Addon"
+name: "keepalived-failover"
 version: "1.0.0"
-slug: "ha_failover_addon"
+slug: "keepalived-failover"
 description: "Add-on per failover HA con VRRP o modalità Supervisor (solo Raspberry)"
 arch:
   - armv7
