@@ -1,0 +1,3 @@
+name: "Keepalived Failover per Home Assistant"
+url: "https://github.com/mirkoa82/ha-keepalived-failover"
+maintainer: "Tu <mirko.aucone@gmail.com>"
