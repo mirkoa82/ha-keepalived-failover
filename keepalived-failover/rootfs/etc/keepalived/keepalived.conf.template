@@ -1,0 +1,39 @@
+global_defs {
+    router_id HA_FAILOVER_{{ NODE_ID }}
+    script_user root
+    enable_script_security
+}
+
+vrrp_script check_ha_peer {
+    script "/usr/local/bin/check_ha_peer.sh"
+    interval {{ CHECK_INTERVAL }}
+    fall 3
+    rise 2
+    timeout 10
+}
+
+vrrp_instance VI_1 {
+    state {{ STATE }}
+    interface {{ INTERFACE }}
+    virtual_router_id {{ VRID }}
+    priority {{ PRIORITY }}
+    advert_int {{ ADVERT_INTERVAL }}
+    {{ PREEMPT }}
+    
+    authentication {
+        auth_type PASS
+        auth_pass {{ PASSWORD }}
+    }
+    
+    track_script {
+        check_ha_peer
+    }
+    
+    virtual_ipaddress {
+        {{ VIRTUAL_IP }}/24 dev {{ INTERFACE }}
+    }
+    
+    notify_master "/usr/local/bin/notify_master.sh"
+    notify_backup "/usr/local/bin/notify_backup.sh"
+    notify_fault "/usr/local/bin/notify_fault.sh"
+}
