@@ -6,6 +6,7 @@ CONFIG="/data/options.json"
 STATE="STANDBY"
 FAILURES=0
 SUCCESSES=0
+CLEANUP_DONE=false
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ha-failover] $*"
@@ -63,13 +64,35 @@ supervisor_post() {
         "http://supervisor${endpoint}"
 }
 
-core_is_running() {
+core_state() {
     local response
+    local state
 
-    response="$(supervisor_get "/core/info" 2>/dev/null || true)"
-    [[ -n "${response}" ]] || return 1
+    response="$(supervisor_get "/core/info" 2>&1)" || {
+        log "ERRORE: GET /core/info non riuscita: ${response}"
+        return 1
+    }
 
-    echo "${response}" | jq -e '(.data // .).state == "running"' >/dev/null 2>&1
+    state="$(echo "${response}" | jq -r '.data.state // .state // empty' 2>/dev/null || true)"
+
+    if [[ -z "${state}" || "${state}" == "null" ]]; then
+        log "ERRORE: stato Core assente nella risposta /core/info: ${response}"
+        return 1
+    fi
+
+    echo "${state}"
+}
+
+core_is_running() {
+    [[ "$(core_state)" == "running" ]]
+}
+
+core_port_open() {
+    nc -z -w 3 127.0.0.1 8123 >/dev/null 2>&1
+}
+
+core_is_ready() {
+    core_is_running && core_port_open
 }
 
 add_vip() {
@@ -124,50 +147,95 @@ announce_vip() {
 }
 
 start_core() {
-    if core_is_running; then
-        log "Home Assistant Core locale già in esecuzione."
-        return 0
+    local response
+    local state
+    local deadline
+    local last_state=""
+
+    state="$(core_state 2>/dev/null || true)"
+    log "Stato Core prima dell'avvio: ${state:-sconosciuto}"
+
+    if [[ "${state}" == "running" ]]; then
+        log "Core già dichiarato running dal Supervisor."
+    else
+        log "Richiedo avvio Home Assistant Core locale."
+
+        response="$(supervisor_post "/core/start" "{}" 2>&1)" || {
+            log "ERRORE: POST /core/start fallita: ${response}"
+            return 1
+        }
+
+        log "Risposta Supervisor a /core/start: ${response}"
     fi
 
-    log "Richiedo avvio Home Assistant Core locale."
-
-    supervisor_post "/core/start" "{}" >/dev/null || return 1
-
-    local deadline=$(( $(date +%s) + CORE_START_TIMEOUT ))
+    deadline=$(( $(date +%s) + CORE_START_TIMEOUT ))
 
     while (( $(date +%s) < deadline )); do
-        if core_is_running && nc -z -w 3 127.0.0.1 8123 >/dev/null 2>&1; then
-            log "Home Assistant Core locale avviato e raggiungibile."
-            return 0
+        state="$(core_state 2>/dev/null || true)"
+
+        if [[ "${state}" != "${last_state}" ]]; then
+            log "Stato Core durante avvio: ${state:-sconosciuto}"
+            last_state="${state}"
         fi
+
+        if [[ "${state}" == "running" ]]; then
+            if core_port_open; then
+                log "Core locale avviato: stato=running, TCP 8123 aperta."
+                return 0
+            fi
+
+            log "Core è running, ma TCP 127.0.0.1:8123 non è ancora aperta."
+        fi
+
         sleep 2
     done
 
-    log "ERRORE: timeout avvio Core (${CORE_START_TIMEOUT}s)."
+    log "ERRORE: timeout avvio Core (${CORE_START_TIMEOUT}s). Ultimo stato: ${last_state:-sconosciuto}"
     return 1
 }
 
 stop_core() {
-    if ! core_is_running; then
+    local response
+    local state
+    local deadline
+    local last_state=""
+
+    state="$(core_state 2>/dev/null || true)"
+    log "Stato Core prima dell'arresto: ${state:-sconosciuto}"
+
+    if [[ "${state}" == "stopped" ]]; then
         log "Home Assistant Core locale già fermo."
         return 0
     fi
 
     log "Richiedo arresto Home Assistant Core locale."
 
-    supervisor_post "/core/stop" '{"force":false}' >/dev/null || return 1
+    response="$(supervisor_post "/core/stop" '{"force":false}' 2>&1)" || {
+        log "ERRORE: POST /core/stop fallita: ${response}"
+        return 1
+    }
 
-    local deadline=$(( $(date +%s) + CORE_STOP_TIMEOUT ))
+    log "Risposta Supervisor a /core/stop: ${response}"
+
+    deadline=$(( $(date +%s) + CORE_STOP_TIMEOUT ))
 
     while (( $(date +%s) < deadline )); do
-        if ! core_is_running; then
+        state="$(core_state 2>/dev/null || true)"
+
+        if [[ "${state}" != "${last_state}" ]]; then
+            log "Stato Core durante arresto: ${state:-sconosciuto}"
+            last_state="${state}"
+        fi
+
+        if [[ "${state}" == "stopped" ]]; then
             log "Home Assistant Core locale arrestato."
             return 0
         fi
+
         sleep 2
     done
 
-    log "ERRORE: timeout arresto Core (${CORE_STOP_TIMEOUT}s)."
+    log "ERRORE: timeout arresto Core (${CORE_STOP_TIMEOUT}s). Ultimo stato: ${last_state:-sconosciuto}"
     return 1
 }
 
@@ -183,8 +251,6 @@ failover() {
     sleep "${POST_VIP_ADD_DELAY}"
 
     if ! start_core; then
-        # Non togliere il VIP: il Core può semplicemente avere bisogno
-        # di più tempo. Rimane nello stato pending e viene controllato.
         STATE="FAILOVER_PENDING"
         FAILURES=0
         SUCCESSES=0
@@ -239,14 +305,23 @@ test_vip() {
 }
 
 cleanup() {
-    log "Ricevuta richiesta di arresto dell'add-on."
+    local exit_code=$?
 
-    # In test rimuove sempre il VIP temporaneo.
-    # In failover operativo NON rimuove il VIP: il Raspberry potrebbe
-    # essere il nodo che sta mantenendo online Home Assistant.
-    if [[ "${TEST_VIP_ONLY:-false}" == "true" ]]; then
-        remove_vip || true
+    if [[ "${CLEANUP_DONE}" == "true" ]]; then
+        return 0
     fi
+    CLEANUP_DONE=true
+
+    log "Ricevuta richiesta di arresto dell'add-on."
+    log "Rilascio VIP ${VIRTUAL_IP}/${PREFIX_LENGTH} prima dell'uscita."
+
+    if remove_vip; then
+        log "VIP rimosso correttamente: arresto add-on consentito."
+    else
+        log "ERRORE: impossibile rimuovere il VIP durante l'arresto."
+    fi
+
+    return "${exit_code}"
 }
 
 need curl
@@ -282,7 +357,8 @@ VIP_TEST_DURATION="$(opt vip_test_duration)"
 ip link show "${INTERFACE}" >/dev/null 2>&1 \
     || fail "Interfaccia non trovata: ${INTERFACE}"
 
-trap cleanup EXIT INT TERM
+trap 'cleanup' EXIT
+trap 'exit 0' INT TERM
 
 log "Add-on operativo avviato."
 log "Interfaccia backup: ${INTERFACE}"
@@ -296,33 +372,52 @@ if is_true "${TEST_VIP_ONLY}"; then
     exit 0
 fi
 
-# Stato iniziale sicuro:
-# - VIP già presente: non toccare nulla, probabilmente è un failover attivo.
-# - Master sano e VIP assente: fermare Core e rimanere standby.
-# - Master KO e VIP assente: attendere le soglie del ciclo monitoraggio.
-if vip_present; then
-    STATE="FAILOVER_ACTIVE"
-    log "VIP già presente all'avvio: riprendo in FAILOVER_ACTIVE."
-
-elif master_ok; then
+# Riconciliazione all'avvio.
+if master_ok; then
     STATE="STANDBY"
-    log "Master sano e nessun VIP presente: avvio in STANDBY."
+    log "Master sano all'avvio: imposto il Raspberry in STANDBY."
+
+    if vip_present; then
+        log "VIP presente sul Raspberry mentre il master è sano: lo rilascio."
+        if remove_vip; then
+            log "VIP rimosso: il master può mantenere ${VIRTUAL_IP}."
+        else
+            log "ERRORE: impossibile rimuovere il VIP all'avvio."
+        fi
+    else
+        log "VIP già assente sul Raspberry."
+    fi
 
     if stop_core; then
         log "Core locale confermato fermo in standby."
     else
-        log "ATTENZIONE: impossibile confermare l'arresto del Core; continuo comunque il monitoraggio."
+        log "ATTENZIONE: impossibile confermare l'arresto del Core locale."
+    fi
+
+elif vip_present; then
+    STATE="FAILOVER_ACTIVE"
+    log "Master non raggiungibile e VIP già presente: riprendo FAILOVER_ACTIVE."
+
+    if core_is_running; then
+        log "Core locale già in esecuzione."
+    else
+        log "Core locale non in esecuzione: avvio/riprendo il failover."
+        if start_core; then
+            log "Core locale disponibile: failover ripristinato."
+        else
+            STATE="FAILOVER_PENDING"
+            log "Core ancora in avvio: stato FAILOVER_PENDING, VIP mantenuto."
+        fi
     fi
 
 else
     STATE="STANDBY"
-    log "Master non raggiungibile all'avvio e nessun VIP presente: attendo il ciclo di failover."
+    log "Master non raggiungibile e VIP assente: attendo le soglie del failover."
 fi
 
 while true; do
-    # Core in avvio lento: VIP è già presente e viene preservato.
     if [[ "${STATE}" == "FAILOVER_PENDING" ]]; then
-        if core_is_running && nc -z -w 3 127.0.0.1 8123 >/dev/null 2>&1; then
+        if core_is_ready; then
             STATE="FAILOVER_ACTIVE"
             FAILURES=0
             SUCCESSES=0
