@@ -3,6 +3,10 @@ set -Eeuo pipefail
 
 CONFIG="/data/options.json"
 
+STATE="STANDBY"
+FAILURES=0
+SUCCESSES=0
+
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ha-failover] $*"
 }
@@ -20,64 +24,143 @@ opt() {
     jq -r ".$1" "${CONFIG}"
 }
 
-master_ok() {
-    ping -n -c 1 -W "${PING_TIMEOUT}" "${MASTER_NODE_IP}" >/dev/null 2>&1 \
-        && nc -z -w "${TCP_TIMEOUT}" "${MASTER_NODE_IP}" 8123 >/dev/null 2>&1
+is_true() {
+    [[ "$1" == "true" ]]
 }
 
-need curl
-need jq
-need ip
-need ping
-need nc
+vip_present() {
+    ip -4 -o addr show dev "${INTERFACE}" \
+        | awk '{print $4}' \
+        | grep -Fxq "${VIRTUAL_IP}/${PREFIX_LENGTH}"
+}
 
-[[ -f "${CONFIG}" ]] || fail "File opzioni non trovato: ${CONFIG}"
-[[ -n "${SUPERVISOR_TOKEN:-}" ]] || fail "SUPERVISOR_TOKEN mancante: verifica hassio_api: true."
+master_ping_ok() {
+    ping -n -c 1 -W "${PING_TIMEOUT}" "${MASTER_NODE_IP}" >/dev/null 2>&1
+}
 
-MASTER_NODE_IP="$(opt master_node_ip)"
-VIRTUAL_IP="$(opt virtual_ip)"
-PREFIX_LENGTH="$(opt prefix_length)"
-INTERFACE="$(opt interface)"
-CHECK_INTERVAL="$(opt check_interval)"
-PING_TIMEOUT="$(opt ping_timeout)"
-TCP_TIMEOUT="$(opt tcp_timeout)"
-FAILOVER_FAILURES="$(opt failover_failures)"
-FAILBACK_SUCCESSES="$(opt failback_successes)"
+master_tcp_ok() {
+    nc -z -w "${TCP_TIMEOUT}" "${MASTER_NODE_IP}" 8123 >/dev/null 2>&1
+}
 
-ip link show "${INTERFACE}" >/dev/null 2>&1 \
-  || fail "Interfaccia non trovata: ${INTERFACE}"
+master_ok() {
+    master_ping_ok && master_tcp_ok
+}
 
-log "Avvio in modalità diagnostica: non verranno modificati VIP o Core."
-log "Interfaccia: ${INTERFACE}"
-log "Master: ${MASTER_NODE_IP}:8123"
-log "VIP pianificato: ${VIRTUAL_IP}/${PREFIX_LENGTH}"
-log "Soglia failover: ${FAILOVER_FAILURES} fallimenti."
-log "Soglia failback: ${FAILBACK_SUCCESSES} successi."
+supervisor_get() {
+    curl -fsS \
+        --header "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
+        "http://supervisor$1"
+}
 
-INFO="$(curl -fsS \
-  --header "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
-  http://supervisor/info 2>&1 || true)"
+supervisor_post() {
+    local endpoint="$1"
+    local payload="${2:-{}}"
 
-if [[ -n "${INFO}" ]]; then
-    log "Supervisor API raggiungibile."
-    echo "${INFO}" | jq -c '.' || true
-else
-    log "ATTENZIONE: Supervisor API non raggiungibile con /info."
-fi
+    curl -fsS -X POST \
+        --header "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
+        --header "Content-Type: application/json" \
+        --data "${payload}" \
+        "http://supervisor${endpoint}"
+}
 
-FAILURES=0
-SUCCESSES=0
+core_is_running() {
+    local response
 
-while true; do
-    if master_ok; then
-        SUCCESSES=$((SUCCESSES + 1))
-        FAILURES=0
-        log "Master OK | successi=${SUCCESSES}/${FAILBACK_SUCCESSES}, fallimenti=0"
-    else
-        FAILURES=$((FAILURES + 1))
-        SUCCESSES=0
-        log "Master KO | fallimenti=${FAILURES}/${FAILOVER_FAILURES}, successi=0"
+    response="$(supervisor_get "/core/info" 2>/dev/null || true)"
+    [[ -n "${response}" ]] || return 1
+
+    echo "${response}" | jq -e '(.data // .).state == "running"' >/dev/null 2>&1
+}
+
+add_vip() {
+    if vip_present; then
+        log "VIP ${VIRTUAL_IP}/${PREFIX_LENGTH} già presente su ${INTERFACE}."
+        return 0
     fi
 
-    sleep "${CHECK_INTERVAL}"
-done
+    log "Aggiungo VIP ${VIRTUAL_IP}/${PREFIX_LENGTH} su ${INTERFACE}."
+
+    ip addr add "${VIRTUAL_IP}/${PREFIX_LENGTH}" dev "${INTERFACE}" || return 1
+
+    if vip_present; then
+        log "VIP verificato: presente su ${INTERFACE}."
+        return 0
+    fi
+
+    log "ERRORE: VIP non trovato dopo l'aggiunta."
+    return 1
+}
+
+remove_vip() {
+    if ! vip_present; then
+        log "VIP ${VIRTUAL_IP}/${PREFIX_LENGTH} già assente da ${INTERFACE}."
+        return 0
+    fi
+
+    log "Rimuovo VIP ${VIRTUAL_IP}/${PREFIX_LENGTH} da ${INTERFACE}."
+
+    ip addr del "${VIRTUAL_IP}/${PREFIX_LENGTH}" dev "${INTERFACE}" || return 1
+
+    if ! vip_present; then
+        log "VIP verificato: rimosso da ${INTERFACE}."
+        return 0
+    fi
+
+    log "ERRORE: VIP ancora presente dopo la rimozione."
+    return 1
+}
+
+announce_vip() {
+    # Il comando è opzionale: accelera l'aggiornamento ARP dei client.
+    # La logica di failover resta valida anche se arping non è disponibile.
+    if command -v arping >/dev/null 2>&1; then
+        local i
+        for i in 1 2 3; do
+            arping -U -I "${INTERFACE}" -c 1 "${VIRTUAL_IP}" >/dev/null 2>&1 || true
+            sleep 1
+        done
+        log "Annuncio ARP del VIP inviato."
+    else
+        log "arping non disponibile: proseguo senza gratuitous ARP."
+    fi
+}
+
+start_core() {
+    if core_is_running; then
+        log "Home Assistant Core locale già in esecuzione."
+        return 0
+    fi
+
+    log "Richiedo avvio Home Assistant Core locale."
+
+    supervisor_post "/core/start" "{}" >/dev/null || return 1
+
+    local deadline=$(( $(date +%s) + CORE_START_TIMEOUT ))
+
+    while (( $(date +%s) < deadline )); do
+        if core_is_running && nc -z -w 3 127.0.0.1 8123 >/dev/null 2>&1; then
+            log "Home Assistant Core locale avviato e raggiungibile."
+            return 0
+        fi
+        sleep 2
+    done
+
+    log "ERRORE: timeout avvio Core (${CORE_START_TIMEOUT}s)."
+    return 1
+}
+
+stop_core() {
+    if ! core_is_running; then
+        log "Home Assistant Core locale già fermo."
+        return 0
+    fi
+
+    log "Richiedo arresto Home Assistant Core locale."
+
+    supervisor_post "/core/stop" '{"force":false}' >/dev/null || return 1
+
+    local deadline=$(( $(date +%s) + CORE_STOP_TIMEOUT ))
+
+    while (( $(date +%s) < deadline )); do
+        if ! core_is_running; then
+            log "
