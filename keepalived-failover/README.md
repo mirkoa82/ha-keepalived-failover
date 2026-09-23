@@ -1,105 +1,250 @@
-# Keepalived HA Failover per Home Assistant
+Home Assistant Active/Passive Failover Add-on
+A Home Assistant OS add-on for an active/passive Home Assistant failover setup using a virtual IP address (VIP).
 
-Add-on per gestire automaticamente il failover di un IP virtuale (VIP) tra due nodi Home Assistant usando VRRP.
+The add-on is intended to run on a backup Home Assistant OS node (for example, a Raspberry Pi). It monitors a primary Home Assistant node and, if the primary becomes unavailable, it assigns the VIP to the backup node and starts the backup Home Assistant Core instance. When the primary becomes stable again, the backup stops its Core instance and releases the VIP.
 
-## Caratteristiche
+Warning: This project changes IP addressing and starts/stops Home Assistant Core. Test it carefully on your own network before relying on it for production use. A short IP-address overlap during automatic failback may occur if the primary node has the same VIP configured persistently.
 
-- ✅ Failover automatico quando il nodo master fallisce
-- ✅ Failback automatico quando il master torna online
-- ✅ Gestione start/stop di Home Assistant
-- ✅ Configurazione semplice via UI
-- ✅ Supporto per auto-detect del ruolo
+Architecture
+Example topology:
 
-## Installazione
+text
+Primary Home Assistant OS node
+  Node/management IP: 10.14.0.237
+  Virtual service IP: 10.14.0.246
 
-### 1. Aggiungi il repository
+Backup Home Assistant OS node (Raspberry Pi)
+  Node/management IP: assigned by your network
+  Virtual service IP: 10.14.0.246 only during failover
+Clients should normally use the virtual service IP:
 
-In Home Assistant:
-1. Vai su **Impostazioni** → **Componenti aggiuntivi**
-2. Clicca sui **tre puntini** in alto a destra → **Repository**
-3. Incolla: `https://github.com/tuo-username/ha-keepalived-failover`
-4. Clicca **Aggiungi**
+text
+http://10.14.0.246:8123
+The backup node monitors the primary node IP and TCP port 8123. It does not monitor the VIP, because the backup owns that address during a failover.
 
-### 2. Installa l'add-on
+Behavior
+Normal operation
+The primary Home Assistant node owns the VIP.
 
-1. Cerca "Keepalived HA Failover" nello store
-2. Clicca **Installa**
-3. **Installa su entrambi i nodi** (master e backup)
+The backup add-on is running.
 
-### 3. Configura
+The backup Home Assistant Core is stopped when the primary is healthy.
 
-#### Nodo Master (es. 10.14.0.237):
+The backup retains its own management IP, which can be used for Observer or host-level access.
 
-```yaml
-node_role: "master"
-virtual_ip: "10.14.0.250"
+Automatic failover
+When the primary fails the configured number of health checks and remains unavailable through the configured grace period, the backup node:
+
+Adds the virtual IP to the active network interface.
+
+Sends gratuitous ARP announcements for the VIP.
+
+Starts Home Assistant Core on the backup node.
+
+Keeps the VIP while Core is starting.
+
+Marks the failover as active once TCP port 8123 becomes available locally.
+
+Automatic failback
+When the primary is reachable and its TCP port 8123 has been stable for the configured number of checks plus the grace period, the backup node:
+
+Stops its local Home Assistant Core.
+
+Removes the virtual IP from the backup interface.
+
+Returns to standby.
+
+The backup intentionally stops Core before releasing the VIP during ordinary failback, reducing the period in which both nodes could serve Home Assistant.
+
+Requirements
+Home Assistant OS on the backup node.
+
+The add-on runs with host networking and NET_ADMIN / NET_RAW privileges.
+
+The backup node must be on the same Layer-2 network as the primary and the VIP.
+
+The primary node must be reachable through its dedicated node IP.
+
+A virtual IP must be reserved for this setup and must not be used by another device.
+
+Home Assistant Supervisor API access is enabled for the add-on.
+
+Installation
+Add this GitHub repository to the Home Assistant Add-on Store.
+
+Install HA Keepalived Failover on the backup Home Assistant OS node.
+
+Configure the primary node IP, virtual IP, and timeouts.
+
+Start the add-on.
+
+Test the VIP safely with test_vip_only: true before enabling real failover.
+
+Configuration
+Example configuration:
+
+text
 master_node_ip: "10.14.0.237"
-slave_node_ip: "10.14.0.245"
-```
+virtual_ip: "10.14.0.246"
+prefix_length: 24
 
-#### Nodo Backup (es. 10.14.0.245):
+# "auto" detects the network interface from the IPv4 default route.
+# You may specify an interface name manually if required.
+interface: "auto"
 
-```yaml
-node_role: "backup"
-virtual_ip: "10.14.0.250"
-master_node_ip: "10.14.0.237"
-slave_node_ip: "10.14.0.245"
-```
+# Set to true only while troubleshooting.
+# When false, the add-on writes only important events and errors.
+debug_logging: false
 
-### 4. Avvia
+check_interval: 5
+ping_timeout: 2
+tcp_timeout: 3
 
-1. Clicca **Avvia** su entrambi i nodi
-2. Attendi che si stabilizzino (15-30 secondi)
-3. Verifica i log
+failover_failures: 6
+failover_grace_period: 30
 
-## Configurazione completa
+failback_successes: 24
+failback_grace_period: 30
 
-| Parametro | Descrizione | Default |
-|-----------|-------------|---------|
-| `node_role` | Ruolo: "master", "backup", o "auto" | "auto" |
-| `virtual_ip` | IP virtuale (VIP) da usare per il failover | "10.14.0.250" |
-| `master_node_ip` | IP fisico del nodo master | "10.14.0.237" |
-| `slave_node_ip` | IP fisico del nodo backup | "10.14.0.245" |
-| `vrid` | Virtual Router ID (deve essere uguale su entrambi) | 51 |
-| `password` | Password VRRP (deve essere uguale su entrambi) | "haus3r2026" |
-| `priority_master` | Priorità del nodo master | 150 |
-| `priority_backup` | Priorità del nodo backup | 90 |
-| `advert_interval` | Intervallo advertisement VRRP (secondi) | 1 |
-| `check_interval` | Intervallo controllo health (secondi) | 5 |
-| `ha_port` | Porta di Home Assistant | 8123 |
-| `interface` | Interfaccia di rete | "eth0" |
-| `enable_preempt` | Se true, il master riprende il VIP quando torna | true |
+core_start_timeout: 300
+core_stop_timeout: 120
 
-## Funzionamento
+post_vip_add_delay: 3
+post_vip_remove_delay: 3
 
-1. **Stato normale**: Il master detiene il VIP e HA è attivo
-2. **Failover**: Se il master fallisce, il backup acquisisce il VIP e avvia HA
-3. **Failback**: Quando il master torna, il backup rilascia il VIP e ferma HA
+# Safe, one-time test: add the VIP, wait, remove it, then exit.
+test_vip_only: false
+vip_test_duration: 10
+Configuration reference
+Option	Description
+master_node_ip	Dedicated IP address of the primary Home Assistant node. The add-on checks ICMP and TCP port 8123 on this address.
+virtual_ip	Virtual service IP moved to the backup node during failover.
+prefix_length	IPv4 network prefix length, for example 24 for a /24 subnet.
+interface	auto uses the interface associated with the IPv4 default route. Set a specific interface only when required.
+debug_logging	Enables detailed periodic logs for troubleshooting. Keep false in normal standby operation to minimize log writes.
+check_interval	Delay, in seconds, between primary health checks.
+ping_timeout	ICMP ping timeout, in seconds.
+tcp_timeout	TCP connection timeout for Home Assistant port 8123, in seconds.
+failover_failures	Consecutive failed checks required before beginning failover.
+failover_grace_period	Additional wait before acquiring the VIP after the failover threshold is reached.
+failback_successes	Consecutive successful checks required before beginning failback.
+failback_grace_period	Additional wait before releasing the VIP after the failback threshold is reached.
+core_start_timeout	Maximum wait for the backup Core to become reachable on TCP port 8123.
+core_stop_timeout	Maximum wait for the backup Core to stop.
+post_vip_add_delay	Delay after adding the VIP before starting Core.
+post_vip_remove_delay	Delay after removing the VIP before completing failback.
+test_vip_only	Enables a non-destructive VIP add/remove test. It does not start/stop Core or alter the primary node.
+vip_test_duration	Number of seconds that the VIP remains assigned during the VIP-only test.
+Interface detection
+With interface: auto, the add-on identifies the active interface from the IPv4 default route. For example:
 
-## Log
+text
+default via 10.14.0.1 dev end0
+In this case it uses end0. This avoids hard-coding a device name such as eth0 or a backup node IP address.
 
-- **Log add-on**: Pannello add-on → Log
-- **Log keepalived**: `docker logs hassio_addon_keepalived_failover`
-- **Log failover**: `/var/log/ha-failover.log` (dentro il container)
+If your host has multiple active network interfaces, policy routing, or multiple default gateways, set the interface explicitly after testing:
 
-## Verifica
+text
+interface: "end0"
+Logging
+Normal standby monitoring should not continuously write log lines to storage. With:
 
-```bash
-# Controlla se il VIP è attivo
-ip addr show eth0 | grep 10.14.0.250
+text
+debug_logging: false
+the add-on logs startup, errors, state transitions, failover/failback actions, VIP changes, and Core start/stop actions, but it does not log each successful standby health probe.
 
-# Test failover: ferma l'add-on sul master
-# Il backup dovrebbe acquisire il VIP dopo 15-20 secondi
-```
+For troubleshooting, temporarily use:
 
-## Problemi noti
+text
+debug_logging: true
+After testing, set it back to false.
 
-### "Operation not permitted"
+Testing safely
+1. Test the virtual IP only
+Before running a failover test, use:
 
-Se vedi errori RTNETLINK, HassOS potrebbe bloccare NET_ADMIN. In tal caso:
-- Usa Home Assistant Container invece di HassOS
-- Oppure usa una VM Linux separata per keepalived
+text
+test_vip_only: true
+vip_test_duration: 10
+The add-on will:
 
-## Supporto
+Add the VIP to the backup network interface.
 
-Segnala problemi su: https://github.com/tuo-username/ha-keepalived-failover/issues
+Verify that it is present.
+
+Send gratuitous ARP announcements when arping is available.
+
+Wait for the configured duration.
+
+Remove the VIP.
+
+Verify that it is absent and exit.
+
+This test does not start or stop Home Assistant Core and does not change the primary node.
+
+2. Test failover
+For a controlled test, use temporarily short values such as:
+
+text
+check_interval: 2
+failover_failures: 2
+failover_grace_period: 5
+failback_successes: 3
+failback_grace_period: 5
+core_start_timeout: 300
+core_stop_timeout: 120
+Then stop the primary node or deliberately make its dedicated IP unavailable. Confirm that the backup acquires the VIP and that Home Assistant is reachable through it.
+
+3. Test failback
+Restore the primary node and wait for the configured number of healthy checks and the grace period. Confirm that the backup stops Core and removes the VIP.
+
+ARP and failback note
+During failover, the backup sends gratuitous ARP announcements to inform LAN clients that the VIP now maps to the backup MAC address.
+
+On failback, some clients may retain the backup MAC address in their ARP cache until the entry expires or is refreshed. If a client cannot reach the VIP immediately after failback, clear its ARP entry or configure the primary node to send gratuitous ARP announcements for the VIP.
+
+On macOS, for example:
+
+bash
+sudo arp -d 10.14.0.246
+A robust production setup should also arrange for the primary node to announce the VIP when it returns to service.
+
+Access when Core is stopped
+When the backup Core is stopped, the normal Home Assistant user interface at port 8123 is unavailable. The backup host and Supervisor remain active.
+
+Useful access paths include:
+
+Observer: http://<backup-node-ip>:4357
+
+Home Assistant OS debug SSH: port 22222, key-based authentication
+
+Local console with HDMI and USB keyboard
+
+Observer is useful for health information but is not a full management UI or shell.
+
+Important limitations
+This add-on is not a distributed Home Assistant cluster: the two Core instances do not automatically synchronize configuration, database, add-on state, Zigbee/Z-Wave radios, or integrations.
+
+Do not allow both nodes to actively control the same devices unless you understand the consequences.
+
+Automatic failback can briefly create a duplicate-IP condition if the primary node automatically restores the same VIP before the backup releases it.
+
+A power loss or host crash cannot run the add-on cleanup routine; the VIP disappears naturally when the backup network interface goes down.
+
+Do not expose Observer or SSH services directly to the public internet.
+
+Recommended production timing
+A conservative starting point is:
+
+text
+check_interval: 5
+failover_failures: 6
+failover_grace_period: 30
+failback_successes: 24
+failback_grace_period: 30
+core_start_timeout: 300
+core_stop_timeout: 120
+This creates approximately 60 seconds of failure detection before failover, plus backup Core startup time. Failback requires approximately 150 seconds of stable primary health, plus shutdown and network convergence time.
+
+License and contributions
+This is a community project. Please test carefully, report issues with sanitized logs and network topology details, and contribute improvements through pull requests.
