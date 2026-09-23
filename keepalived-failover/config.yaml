@@ -1,61 +1,69 @@
-name: "keepalived-failover"
+name: "HA Keepalived Failover"
 version: "1.0.0"
 slug: "keepalived-failover"
-description: "Add-on per failover HA con VRRP o modalità Supervisor (solo Raspberry)"
+description: "Monitor per failover automatico Home Assistant sul Raspberry di backup"
+url: "https://github.com/mirkoa82/ha-keepalived-failover"
+
 arch:
-  - armv7
   - aarch64
+  - armv7
   - amd64
+
 init: false
 startup: services
 boot: auto
+
+# Accesso alla Supervisor API per test e gestione Core.
 hassio_api: true
 hassio_role: manager
+
+# Necessario per monitorare il master e, nella fase successiva,
+# aggiungere/rimuovere l'IP virtuale sull'interfaccia host.
 host_network: true
+
 privileged:
   - NET_ADMIN
-  - SYS_ADMIN
-ports:
-  8123/tcp: 8123
+
 options:
-  node_role: master
-  virtual_ip: 10.14.0.246
+  master_node_ip: "10.14.0.237"
+  virtual_ip: "10.14.0.246"
   prefix_length: 24
-  master_node_ip: 10.14.0.237
-  backup_node_ip: 10.14.0.245
-  vrid: 51
-  vrrp_password: cambiare123
-  priority_master: 150
-  priority_backup: 100
-  operational_mode: supervisor
+  interface: "eth0"
+
   check_interval: 5
+  ping_timeout: 2
+  tcp_timeout: 3
+
   failover_failures: 6
   failover_grace_period: 30
+
   failback_successes: 24
   failback_grace_period: 30
-  tcp_timeout: 3
+
   core_start_timeout: 180
   core_stop_timeout: 60
-  post_vip_add_delay: 5
-  post_vip_remove_delay: 5
+
+  post_vip_add_delay: 3
+  post_vip_remove_delay: 3
+
 schema:
-  node_role: list(master|backup)
-  virtual_ip: str
-  prefix_length: int
   master_node_ip: str
-  backup_node_ip: str
-  vrid: int(1,255)
-  vrrp_password: str
-  priority_master: int(1,254)
-  priority_backup: int(1,254)
-  operational_mode: list(vrrp|supervisor)
+  virtual_ip: str
+  prefix_length: int(1,32)
+  interface: str
+
   check_interval: int(1,60)
-  failover_failures: int(1,60)
-  failover_grace_period: int(0,300)
-  failback_successes: int(1,120)
-  failback_grace_period: int(0,300)
+  ping_timeout: int(1,15)
   tcp_timeout: int(1,30)
-  core_start_timeout: int(10,600)
-  core_stop_timeout: int(10,300)
+
+  failover_failures: int(1,120)
+  failover_grace_period: int(0,900)
+
+  failback_successes: int(1,360)
+  failback_grace_period: int(0,1800)
+
+  core_start_timeout: int(15,900)
+  core_stop_timeout: int(15,600)
+
   post_vip_add_delay: int(0,60)
   post_vip_remove_delay: int(0,60)
