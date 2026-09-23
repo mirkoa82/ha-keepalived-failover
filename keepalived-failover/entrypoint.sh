@@ -35,63 +35,97 @@ vip_present() {
         | grep -Fxq "${VIRTUAL_IP}/${PREFIX_LENGTH}"
 }
 
-master_ping_ok() {
-    ping -n -c 1 -W "${PING_TIMEOUT}" "${MASTER_NODE_IP}" >/dev/null 2>&1
-}
-
-master_tcp_ok() {
-    nc -z -w "${TCP_TIMEOUT}" "${MASTER_NODE_IP}" 8123 >/dev/null 2>&1
-}
-
 master_ok() {
-    master_ping_ok && master_tcp_ok
-}
-
-core_cli_available() {
-    command -v ha >/dev/null 2>&1
-}
-
-core_info() {
-    if ! core_cli_available; then
-        log "ERRORE: il comando 'ha' non è disponibile nel container dell'add-on."
-        return 127
-    fi
-
-    ha core info 2>&1
-}
-
-core_state() {
-    local response
-    local state
-
-    response="$(core_info)" || {
-        log "ERRORE: 'ha core info' fallito: ${response}"
-        return 1
-    }
-
-    # Il CLI può emettere JSON con state a diversi livelli.
-    state="$(echo "${response}" | jq -r '
-        .data.state // .state // .data.status // .status // empty
-    ' 2>/dev/null || true)"
-
-    if [[ -z "${state}" || "${state}" == "null" ]]; then
-        log "ERRORE: stato Core assente nell'output di 'ha core info': ${response}"
-        return 1
-    fi
-
-    echo "${state}"
-}
-
-core_is_running() {
-    [[ "$(core_state)" == "running" ]]
+    ping -n -c 1 -W "${PING_TIMEOUT}" "${MASTER_NODE_IP}" >/dev/null 2>&1 \
+        && nc -z -w "${TCP_TIMEOUT}" "${MASTER_NODE_IP}" 8123 >/dev/null 2>&1
 }
 
 core_port_open() {
     nc -z -w 3 127.0.0.1 8123 >/dev/null 2>&1
 }
 
-core_is_ready() {
-    core_is_running && core_port_open
+supervisor_post_core() {
+    local action="$1"
+    local response
+    local http_code
+
+    response="$(curl -sS \
+        -o /tmp/supervisor-core-response.json \
+        -w '%{http_code}' \
+        -X POST \
+        --header "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
+        "http://supervisor/core/${action}" 2>&1)" || {
+        log "ERRORE: richiesta Supervisor /core/${action} non riuscita: ${response}"
+        return 1
+    }
+
+    http_code="${response}"
+
+    if [[ -f /tmp/supervisor-core-response.json ]]; then
+        response="$(cat /tmp/supervisor-core-response.json)"
+    else
+        response=""
+    fi
+
+    log "Risposta Supervisor /core/${action}: HTTP ${http_code} ${response}"
+
+    [[ "${http_code}" =~ ^2[0-9][0-9]$ ]]
+}
+
+start_core() {
+    local deadline
+
+    if core_port_open; then
+        log "Core locale già raggiungibile sulla porta 8123."
+        return 0
+    fi
+
+    log "Richiedo avvio Home Assistant Core locale."
+    supervisor_post_core "start" || {
+        log "ERRORE: richiesta avvio Core rifiutata."
+        return 1
+    }
+
+    deadline=$(( $(date +%s) + CORE_START_TIMEOUT ))
+
+    while (( $(date +%s) < deadline )); do
+        if core_port_open; then
+            log "Core locale avviato e porta TCP 8123 disponibile."
+            return 0
+        fi
+        sleep 2
+    done
+
+    log "ERRORE: timeout avvio Core (${CORE_START_TIMEOUT}s)."
+    return 1
+}
+
+stop_core() {
+    local deadline
+
+    if ! core_port_open; then
+        log "Core locale già fermo: porta TCP 8123 chiusa."
+        return 0
+    fi
+
+    log "Richiedo arresto Home Assistant Core locale."
+    supervisor_post_core "stop" || {
+        log "ERRORE: richiesta arresto Core rifiutata."
+        return 1
+    }
+
+    deadline=$(( $(date +%s) + CORE_STOP_TIMEOUT ))
+
+    while (( $(date +%s) < deadline )); do
+        if ! core_port_open; then
+            log "Core locale arrestato: porta TCP 8123 chiusa."
+            return 0
+        fi
+        sleep 2
+    done
+
+    log "ERRORE: timeout arresto Core (${CORE_STOP_TIMEOUT}s)."
+    return 1
 }
 
 add_vip() {
@@ -143,95 +177,6 @@ announce_vip() {
     else
         log "arping non disponibile: proseguo senza gratuitous ARP."
     fi
-}
-
-start_core() {
-    local response
-    local deadline
-    local state
-    local last_state=""
-
-    state="$(core_state 2>/dev/null || true)"
-    log "Stato Core prima dell'avvio: ${state:-sconosciuto}"
-
-    if [[ "${state}" == "running" ]]; then
-        log "Core già dichiarato running."
-    else
-        log "Richiedo avvio Home Assistant Core locale."
-
-        response="$(ha core start 2>&1)" || {
-            log "ERRORE: 'ha core start' fallito: ${response}"
-            return 1
-        }
-
-        log "Risposta 'ha core start': ${response}"
-    fi
-
-    deadline=$(( $(date +%s) + CORE_START_TIMEOUT ))
-
-    while (( $(date +%s) < deadline )); do
-        state="$(core_state 2>/dev/null || true)"
-
-        if [[ "${state}" != "${last_state}" ]]; then
-            log "Stato Core durante avvio: ${state:-sconosciuto}"
-            last_state="${state}"
-        fi
-
-        if [[ "${state}" == "running" ]] && core_port_open; then
-            log "Core locale avviato: stato=running, TCP 8123 aperta."
-            return 0
-        fi
-
-        sleep 2
-    done
-
-    log "ERRORE: timeout avvio Core (${CORE_START_TIMEOUT}s). Ultimo stato: ${last_state:-sconosciuto}"
-    return 1
-}
-
-stop_core() {
-    local response
-    local deadline
-    local state
-    local last_state=""
-
-    state="$(core_state 2>/dev/null || true)"
-    log "Stato Core prima dell'arresto: ${state:-sconosciuto}"
-
-    if [[ "${state}" == "stopped" ]]; then
-        log "Home Assistant Core locale già fermo."
-        return 0
-    fi
-
-    log "Richiedo arresto Home Assistant Core locale."
-
-    response="$(ha core stop 2>&1)" || {
-        log "ERRORE: 'ha core stop' fallito: ${response}"
-        return 1
-    }
-
-    log "Risposta 'ha core stop': ${response}"
-
-    deadline=$(( $(date +%s) + CORE_STOP_TIMEOUT ))
-
-    while (( $(date +%s) < deadline )); do
-        state="$(core_state 2>/dev/null || true)"
-
-        if [[ "${state}" != "${last_state}" ]]; then
-            log "Stato Core durante arresto: ${state:-sconosciuto}"
-            last_state="${state}"
-        fi
-
-        if [[ "${state}" == "stopped" ]]; then
-            log "Home Assistant Core locale arrestato."
-            return 0
-        fi
-
-        sleep 2
-    done
-
-    log "ERRORE: timeout arresto Core (${CORE_STOP_TIMEOUT}s). Ultimo stato: ${last_state:-sconosciuto}"
-    return 1
 }
 
 failover() {
@@ -358,15 +303,6 @@ log "VIP gestito: ${VIRTUAL_IP}/${PREFIX_LENGTH}"
 log "Failover: ${FAILOVER_FAILURES} fallimenti + ${FAILOVER_GRACE_PERIOD}s."
 log "Failback: ${FAILBACK_SUCCESSES} successi + ${FAILBACK_GRACE_PERIOD}s."
 
-if ! core_cli_available; then
-    log "ERRORE BLOCCANTE: il comando 'ha' non è disponibile nell'add-on."
-    log "Il monitoraggio IP può funzionare, ma start/stop Core non è supportato senza CLI."
-    exit 1
-fi
-
-log "Diagnostica: output di 'ha core info':"
-core_info || true
-
 if is_true "${TEST_VIP_ONLY}"; then
     test_vip
     exit 0
@@ -394,7 +330,7 @@ elif vip_present; then
     STATE="FAILOVER_ACTIVE"
     log "Master non raggiungibile e VIP già presente: riprendo FAILOVER_ACTIVE."
 
-    if core_is_ready; then
+    if core_port_open; then
         log "Core locale già disponibile."
     else
         log "Core locale non disponibile: provo ad avviarlo."
@@ -413,7 +349,7 @@ fi
 
 while true; do
     if [[ "${STATE}" == "FAILOVER_PENDING" ]]; then
-        if core_is_ready; then
+        if core_port_open; then
             STATE="FAILOVER_ACTIVE"
             FAILURES=0
             SUCCESSES=0
