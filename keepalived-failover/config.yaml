@@ -1,5 +1,5 @@
 name: "HA Keepalived Failover"
-version: "1.0.1"
+version: "1.0.2"
 slug: "keepalived-failover"
 description: "Monitor per failover automatico Home Assistant sul Raspberry di backup"
 url: "https://github.com/mirkoa82/ha-keepalived-failover"
@@ -17,8 +17,7 @@ boot: auto
 hassio_api: true
 hassio_role: manager
 
-# Necessario per monitorare il master e, nella fase successiva,
-# aggiungere/rimuovere l'IP virtuale sull'interfaccia host.
+# Rete host e privilegi necessari per aggiungere/rimuovere il VIP.
 host_network: true
 
 privileged:
@@ -28,7 +27,9 @@ options:
   master_node_ip: "10.14.0.237"
   virtual_ip: "10.14.0.246"
   prefix_length: 24
-  interface: "eth0"
+
+  # Interfaccia confermata dai log del Raspberry.
+  interface: "end0"
 
   check_interval: 5
   ping_timeout: 2
@@ -45,6 +46,12 @@ options:
 
   post_vip_add_delay: 3
   post_vip_remove_delay: 3
+
+  # true solo per il test controllato del VIP.
+  # L'add-on aggiunge .246 per vip_test_duration secondi,
+  # poi lo rimuove e termina. Non avvia/ferma Core.
+  test_vip_only: false
+  vip_test_duration: 10
 
 schema:
   master_node_ip: str
@@ -67,3 +74,6 @@ schema:
 
   post_vip_add_delay: int(0,60)
   post_vip_remove_delay: int(0,60)
+
+  test_vip_only: bool
+  vip_test_duration: int(1,120)
