@@ -1,7 +1,7 @@
 name: "HA Keepalived Failover"
-version: "1.2.1"
+version: "1.2.2"
 slug: "keepalived-failover"
-description: "Failover automatico Home Assistant sul Raspberry di backup"
+description: "Active/passive Home Assistant failover with a virtual IP"
 url: "https://github.com/mirkoa82/ha-keepalived-failover"
 
 arch:
@@ -13,11 +13,8 @@ init: false
 startup: services
 boot: auto
 
-# Accesso alla Supervisor API.
 hassio_api: true
 hassio_role: manager
-
-# Necessario per controlli rete, gestione VIP e gratuitous ARP.
 host_network: true
 
 privileged:
@@ -25,20 +22,15 @@ privileged:
   - NET_RAW
 
 options:
-  # IP fisso del nodo master: viene verificato con ping e TCP 8123.
   master_node_ip: "10.14.0.237"
-
-  # IP virtuale che appartiene al master in condizioni normali
-  # e al Raspberry solo durante il failover.
   virtual_ip: "10.14.0.246"
   prefix_length: 24
 
-  # auto = interfaccia IPv4 associata alla route default.
-  # Puoi forzare, ad esempio, "end0" solo in una rete particolare.
+  # "auto" uses the IPv4 default route to find the active LAN interface.
   interface: "auto"
 
-  # false = solo eventi, transizioni e errori; nessun log ad ogni sondaggio.
-  # true = log dettagliati per debug.
+  # Exposed in the add-on Configuration tab.
+  # false = important events/errors only; true = detailed diagnostic logs.
   debug_logging: false
 
   check_interval: 5
@@ -57,7 +49,6 @@ options:
   post_vip_add_delay: 3
   post_vip_remove_delay: 3
 
-  # true: prova add/rimozione VIP e termina, senza gestire Core/master.
   test_vip_only: false
   vip_test_duration: 10
 
@@ -65,7 +56,11 @@ schema:
   master_node_ip: str
   virtual_ip: str
   prefix_length: int(1,32)
+
+  # This must stay str: it accepts "auto" or a manually specified interface.
   interface: str
+
+  # This creates the visible true/false switch in Add-on Configuration.
   debug_logging: bool
 
   check_interval: int(1,60)
