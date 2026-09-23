@@ -47,36 +47,35 @@ master_ok() {
     master_ping_ok && master_tcp_ok
 }
 
-supervisor_get() {
-    curl -fsS \
-        --header "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
-        "http://supervisor$1"
+core_cli_available() {
+    command -v ha >/dev/null 2>&1
 }
 
-supervisor_post() {
-    local endpoint="$1"
-    local payload="${2:-{}}"
+core_info() {
+    if ! core_cli_available; then
+        log "ERRORE: il comando 'ha' non è disponibile nel container dell'add-on."
+        return 127
+    fi
 
-    curl -fsS -X POST \
-        --header "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
-        --header "Content-Type: application/json" \
-        --data "${payload}" \
-        "http://supervisor${endpoint}"
+    ha core info 2>&1
 }
 
 core_state() {
     local response
     local state
 
-    response="$(supervisor_get "/core/info" 2>&1)" || {
-        log "ERRORE: GET /core/info non riuscita: ${response}"
+    response="$(core_info)" || {
+        log "ERRORE: 'ha core info' fallito: ${response}"
         return 1
     }
 
-    state="$(echo "${response}" | jq -r '.data.state // .state // empty' 2>/dev/null || true)"
+    # Il CLI può emettere JSON con state a diversi livelli.
+    state="$(echo "${response}" | jq -r '
+        .data.state // .state // .data.status // .status // empty
+    ' 2>/dev/null || true)"
 
     if [[ -z "${state}" || "${state}" == "null" ]]; then
-        log "ERRORE: stato Core assente nella risposta /core/info: ${response}"
+        log "ERRORE: stato Core assente nell'output di 'ha core info': ${response}"
         return 1
     fi
 
@@ -148,24 +147,24 @@ announce_vip() {
 
 start_core() {
     local response
-    local state
     local deadline
+    local state
     local last_state=""
 
     state="$(core_state 2>/dev/null || true)"
     log "Stato Core prima dell'avvio: ${state:-sconosciuto}"
 
     if [[ "${state}" == "running" ]]; then
-        log "Core già dichiarato running dal Supervisor."
+        log "Core già dichiarato running."
     else
         log "Richiedo avvio Home Assistant Core locale."
 
-        response="$(supervisor_post "/core/start" "{}" 2>&1)" || {
-            log "ERRORE: POST /core/start fallita: ${response}"
+        response="$(ha core start 2>&1)" || {
+            log "ERRORE: 'ha core start' fallito: ${response}"
             return 1
         }
 
-        log "Risposta Supervisor a /core/start: ${response}"
+        log "Risposta 'ha core start': ${response}"
     fi
 
     deadline=$(( $(date +%s) + CORE_START_TIMEOUT ))
@@ -178,13 +177,9 @@ start_core() {
             last_state="${state}"
         fi
 
-        if [[ "${state}" == "running" ]]; then
-            if core_port_open; then
-                log "Core locale avviato: stato=running, TCP 8123 aperta."
-                return 0
-            fi
-
-            log "Core è running, ma TCP 127.0.0.1:8123 non è ancora aperta."
+        if [[ "${state}" == "running" ]] && core_port_open; then
+            log "Core locale avviato: stato=running, TCP 8123 aperta."
+            return 0
         fi
 
         sleep 2
@@ -196,8 +191,8 @@ start_core() {
 
 stop_core() {
     local response
-    local state
     local deadline
+    local state
     local last_state=""
 
     state="$(core_state 2>/dev/null || true)"
@@ -210,12 +205,12 @@ stop_core() {
 
     log "Richiedo arresto Home Assistant Core locale."
 
-    response="$(supervisor_post "/core/stop" '{"force":false}' 2>&1)" || {
-        log "ERRORE: POST /core/stop fallita: ${response}"
+    response="$(ha core stop 2>&1)" || {
+        log "ERRORE: 'ha core stop' fallito: ${response}"
         return 1
     }
 
-    log "Risposta Supervisor a /core/stop: ${response}"
+    log "Risposta 'ha core stop': ${response}"
 
     deadline=$(( $(date +%s) + CORE_STOP_TIMEOUT ))
 
@@ -305,8 +300,6 @@ test_vip() {
 }
 
 cleanup() {
-    local exit_code=$?
-
     if [[ "${CLEANUP_DONE}" == "true" ]]; then
         return 0
     fi
@@ -320,8 +313,6 @@ cleanup() {
     else
         log "ERRORE: impossibile rimuovere il VIP durante l'arresto."
     fi
-
-    return "${exit_code}"
 }
 
 need curl
@@ -367,23 +358,28 @@ log "VIP gestito: ${VIRTUAL_IP}/${PREFIX_LENGTH}"
 log "Failover: ${FAILOVER_FAILURES} fallimenti + ${FAILOVER_GRACE_PERIOD}s."
 log "Failback: ${FAILBACK_SUCCESSES} successi + ${FAILBACK_GRACE_PERIOD}s."
 
+if ! core_cli_available; then
+    log "ERRORE BLOCCANTE: il comando 'ha' non è disponibile nell'add-on."
+    log "Il monitoraggio IP può funzionare, ma start/stop Core non è supportato senza CLI."
+    exit 1
+fi
+
+log "Diagnostica: output di 'ha core info':"
+core_info || true
+
 if is_true "${TEST_VIP_ONLY}"; then
     test_vip
     exit 0
 fi
 
-# Riconciliazione all'avvio.
+# Riconciliazione iniziale.
 if master_ok; then
     STATE="STANDBY"
     log "Master sano all'avvio: imposto il Raspberry in STANDBY."
 
     if vip_present; then
         log "VIP presente sul Raspberry mentre il master è sano: lo rilascio."
-        if remove_vip; then
-            log "VIP rimosso: il master può mantenere ${VIRTUAL_IP}."
-        else
-            log "ERRORE: impossibile rimuovere il VIP all'avvio."
-        fi
+        remove_vip || log "ERRORE: impossibile rimuovere il VIP all'avvio."
     else
         log "VIP già assente sul Raspberry."
     fi
@@ -398,10 +394,10 @@ elif vip_present; then
     STATE="FAILOVER_ACTIVE"
     log "Master non raggiungibile e VIP già presente: riprendo FAILOVER_ACTIVE."
 
-    if core_is_running; then
-        log "Core locale già in esecuzione."
+    if core_is_ready; then
+        log "Core locale già disponibile."
     else
-        log "Core locale non in esecuzione: avvio/riprendo il failover."
+        log "Core locale non disponibile: provo ad avviarlo."
         if start_core; then
             log "Core locale disponibile: failover ripristinato."
         else
@@ -412,7 +408,7 @@ elif vip_present; then
 
 else
     STATE="STANDBY"
-    log "Master non raggiungibile e VIP assente: attendo le soglie del failover."
+    log "Master non raggiungibile e VIP assente: attendo il ciclo di failover."
 fi
 
 while true; do
