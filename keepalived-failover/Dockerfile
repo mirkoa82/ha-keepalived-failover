@@ -4,14 +4,12 @@ FROM $BUILD_FROM
 RUN apk add --no-cache \
     bash \
     curl \
+    jq \
     iproute2 \
-    keepalived \
-    arping
+    iputils \
+    busybox-extras
 
-COPY rootfs /
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod a+x /entrypoint.sh
 
-RUN chmod 755 \
-    /run.sh \
-    /usr/local/bin/detect_interface.sh
-
-CMD ["/run.sh"]
+CMD ["/entrypoint.sh"]
