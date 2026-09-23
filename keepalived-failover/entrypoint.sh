@@ -111,8 +111,6 @@ remove_vip() {
 }
 
 announce_vip() {
-    # Il comando è opzionale: accelera l'aggiornamento ARP dei client.
-    # La logica di failover resta valida anche se arping non è disponibile.
     if command -v arping >/dev/null 2>&1; then
         local i
         for i in 1 2 3; do
@@ -176,7 +174,6 @@ stop_core() {
 failover() {
     log "========== INIZIO FAILOVER =========="
 
-    # Il VIP prima: il Core si avvierà già sull'indirizzo usato dai client.
     if ! add_vip; then
         log "ERRORE: impossibile aggiungere VIP; failover annullato."
         return 1
@@ -186,8 +183,13 @@ failover() {
     sleep "${POST_VIP_ADD_DELAY}"
 
     if ! start_core; then
-        log "ERRORE: Core non avviato; rimuovo VIP per non lasciare un endpoint non funzionante."
-        remove_vip || true
+        # Non togliere il VIP: il Core può semplicemente avere bisogno
+        # di più tempo. Rimane nello stato pending e viene controllato.
+        STATE="FAILOVER_PENDING"
+        FAILURES=0
+        SUCCESSES=0
+        log "Core non ancora disponibile entro ${CORE_START_TIMEOUT}s."
+        log "VIP mantenuto; stato FAILOVER_PENDING."
         return 1
     fi
 
@@ -203,7 +205,6 @@ failback() {
     log "========== INIZIO FAILBACK =========="
     log "Master ${MASTER_NODE_IP} stabile: arresto Core backup e rilascio VIP."
 
-    # Core prima del VIP: riduce la possibilità che due Core servano automazioni.
     if ! stop_core; then
         log "ERRORE: Core backup non arrestato; non rimuovo il VIP."
         return 1
@@ -240,11 +241,9 @@ test_vip() {
 cleanup() {
     log "Ricevuta richiesta di arresto dell'add-on."
 
-    # Non rimuovere automaticamente il VIP nella modalità operativa:
-    # se il Raspberry sta gestendo il failover, toglierlo al riavvio
-    # dell'add-on renderebbe Home Assistant irraggiungibile.
-    #
-    # Il test VIP invece deve sempre pulire l'indirizzo temporaneo.
+    # In test rimuove sempre il VIP temporaneo.
+    # In failover operativo NON rimuove il VIP: il Raspberry potrebbe
+    # essere il nodo che sta mantenendo online Home Assistant.
     if [[ "${TEST_VIP_ONLY:-false}" == "true" ]]; then
         remove_vip || true
     fi
@@ -297,17 +296,45 @@ if is_true "${TEST_VIP_ONLY}"; then
     exit 0
 fi
 
-# Se l'add-on viene riavviato durante un failover e trova già il VIP,
-# riprende nello stato attivo invece di rimuoverlo.
+# Stato iniziale sicuro:
+# - VIP già presente: non toccare nulla, probabilmente è un failover attivo.
+# - Master sano e VIP assente: fermare Core e rimanere standby.
+# - Master KO e VIP assente: attendere le soglie del ciclo monitoraggio.
 if vip_present; then
     STATE="FAILOVER_ACTIVE"
     log "VIP già presente all'avvio: riprendo in FAILOVER_ACTIVE."
+
+elif master_ok; then
+    STATE="STANDBY"
+    log "Master sano e nessun VIP presente: avvio in STANDBY."
+
+    if stop_core; then
+        log "Core locale confermato fermo in standby."
+    else
+        log "ATTENZIONE: impossibile confermare l'arresto del Core; continuo comunque il monitoraggio."
+    fi
+
 else
     STATE="STANDBY"
-    log "Nessun VIP presente: avvio in STANDBY."
+    log "Master non raggiungibile all'avvio e nessun VIP presente: attendo il ciclo di failover."
 fi
 
 while true; do
+    # Core in avvio lento: VIP è già presente e viene preservato.
+    if [[ "${STATE}" == "FAILOVER_PENDING" ]]; then
+        if core_is_running && nc -z -w 3 127.0.0.1 8123 >/dev/null 2>&1; then
+            STATE="FAILOVER_ACTIVE"
+            FAILURES=0
+            SUCCESSES=0
+            log "Core locale ora disponibile: failover completato."
+        else
+            log "Failover pending: VIP mantenuto; attendo l'avvio del Core locale."
+        fi
+
+        sleep "${CHECK_INTERVAL}"
+        continue
+    fi
+
     if master_ok; then
         if [[ "${STATE}" == "STANDBY" ]]; then
             FAILURES=0
