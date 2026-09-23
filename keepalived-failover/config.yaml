@@ -1,5 +1,5 @@
 name: "HA Keepalived Failover"
-version: "1.1.1"
+version: "1.1.2"
 slug: "keepalived-failover"
 description: "Failover automatico Home Assistant sul Raspberry di backup"
 url: "https://github.com/mirkoa82/ha-keepalived-failover"
