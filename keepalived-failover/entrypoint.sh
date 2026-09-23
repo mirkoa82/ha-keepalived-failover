@@ -12,6 +12,12 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ha-failover] $*"
 }
 
+debug() {
+    if [[ "${DEBUG_LOGGING:-false}" == "true" ]]; then
+        log "DEBUG: $*"
+    fi
+}
+
 fail() {
     log "ERRORE: $*"
     exit 1
@@ -29,15 +35,54 @@ is_true() {
     [[ "$1" == "true" ]]
 }
 
+detect_interface() {
+    local detected
+
+    if [[ "${INTERFACE_CONFIG}" != "auto" ]]; then
+        ip link show "${INTERFACE_CONFIG}" >/dev/null 2>&1 \
+            || fail "Interfaccia configurata non trovata: ${INTERFACE_CONFIG}"
+
+        echo "${INTERFACE_CONFIG}"
+        return 0
+    fi
+
+    detected="$(
+        ip -4 route show default 2>/dev/null \
+        | awk '/^default/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "dev") {
+                    print $(i + 1)
+                    exit
+                }
+            }
+        }'
+    )"
+
+    [[ -n "${detected}" ]] \
+        || fail "Impossibile rilevare l'interfaccia dalla route IPv4 predefinita"
+
+    ip link show "${detected}" >/dev/null 2>&1 \
+        || fail "Interfaccia rilevata non disponibile: ${detected}"
+
+    echo "${detected}"
+}
+
 vip_present() {
     ip -4 -o addr show dev "${INTERFACE}" \
         | awk '{print $4}' \
         | grep -Fxq "${VIRTUAL_IP}/${PREFIX_LENGTH}"
 }
 
+master_ping_ok() {
+    ping -n -c 1 -W "${PING_TIMEOUT}" "${MASTER_NODE_IP}" >/dev/null 2>&1
+}
+
+master_tcp_ok() {
+    nc -z -w "${TCP_TIMEOUT}" "${MASTER_NODE_IP}" 8123 >/dev/null 2>&1
+}
+
 master_ok() {
-    ping -n -c 1 -W "${PING_TIMEOUT}" "${MASTER_NODE_IP}" >/dev/null 2>&1 \
-        && nc -z -w "${TCP_TIMEOUT}" "${MASTER_NODE_IP}" 8123 >/dev/null 2>&1
+    master_ping_ok && master_tcp_ok
 }
 
 core_port_open() {
@@ -46,28 +91,29 @@ core_port_open() {
 
 supervisor_post_core() {
     local action="$1"
-    local response
     local http_code
+    local body_file="/tmp/supervisor-core-${action}.json"
+    local curl_output
 
-    response="$(curl -sS \
-        -o /tmp/supervisor-core-response.json \
-        -w '%{http_code}' \
-        -X POST \
-        --header "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
-        "http://supervisor/core/${action}" 2>&1)" || {
-        log "ERRORE: richiesta Supervisor /core/${action} non riuscita: ${response}"
+    curl_output="$(
+        curl -sS \
+            -o "${body_file}" \
+            -w '%{http_code}' \
+            -X POST \
+            --header "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
+            "http://supervisor/core/${action}" 2>&1
+    )" || {
+        log "ERRORE: richiesta Supervisor /core/${action} non riuscita: ${curl_output}"
         return 1
     }
 
-    http_code="${response}"
+    http_code="${curl_output}"
 
-    if [[ -f /tmp/supervisor-core-response.json ]]; then
-        response="$(cat /tmp/supervisor-core-response.json)"
+    if [[ -f "${body_file}" ]]; then
+        debug "Risposta Supervisor /core/${action}: HTTP ${http_code} $(cat "${body_file}")"
     else
-        response=""
+        debug "Risposta Supervisor /core/${action}: HTTP ${http_code}"
     fi
-
-    log "Risposta Supervisor /core/${action}: HTTP ${http_code} ${response}"
 
     [[ "${http_code}" =~ ^2[0-9][0-9]$ ]]
 }
@@ -81,10 +127,11 @@ start_core() {
     fi
 
     log "Richiedo avvio Home Assistant Core locale."
-    supervisor_post_core "start" || {
+
+    if ! supervisor_post_core "start"; then
         log "ERRORE: richiesta avvio Core rifiutata."
         return 1
-    }
+    fi
 
     deadline=$(( $(date +%s) + CORE_START_TIMEOUT ))
 
@@ -93,6 +140,8 @@ start_core() {
             log "Core locale avviato e porta TCP 8123 disponibile."
             return 0
         fi
+
+        debug "Core ancora in avvio: porta 8123 non disponibile."
         sleep 2
     done
 
@@ -109,10 +158,11 @@ stop_core() {
     fi
 
     log "Richiedo arresto Home Assistant Core locale."
-    supervisor_post_core "stop" || {
+
+    if ! supervisor_post_core "stop"; then
         log "ERRORE: richiesta arresto Core rifiutata."
         return 1
-    }
+    fi
 
     deadline=$(( $(date +%s) + CORE_STOP_TIMEOUT ))
 
@@ -121,6 +171,8 @@ stop_core() {
             log "Core locale arrestato: porta TCP 8123 chiusa."
             return 0
         fi
+
+        debug "Core ancora in arresto: porta 8123 aperta."
         sleep 2
     done
 
@@ -136,7 +188,10 @@ add_vip() {
 
     log "Aggiungo VIP ${VIRTUAL_IP}/${PREFIX_LENGTH} su ${INTERFACE}."
 
-    ip addr add "${VIRTUAL_IP}/${PREFIX_LENGTH}" dev "${INTERFACE}" || return 1
+    ip addr add "${VIRTUAL_IP}/${PREFIX_LENGTH}" dev "${INTERFACE}" || {
+        log "ERRORE: comando ip addr add fallito."
+        return 1
+    }
 
     if vip_present; then
         log "VIP verificato: presente su ${INTERFACE}."
@@ -155,7 +210,10 @@ remove_vip() {
 
     log "Rimuovo VIP ${VIRTUAL_IP}/${PREFIX_LENGTH} da ${INTERFACE}."
 
-    ip addr del "${VIRTUAL_IP}/${PREFIX_LENGTH}" dev "${INTERFACE}" || return 1
+    ip addr del "${VIRTUAL_IP}/${PREFIX_LENGTH}" dev "${INTERFACE}" || {
+        log "ERRORE: comando ip addr del fallito."
+        return 1
+    }
 
     if ! vip_present; then
         log "VIP verificato: rimosso da ${INTERFACE}."
@@ -169,10 +227,12 @@ remove_vip() {
 announce_vip() {
     if command -v arping >/dev/null 2>&1; then
         local i
+
         for i in 1 2 3; do
             arping -U -I "${INTERFACE}" -c 1 "${VIRTUAL_IP}" >/dev/null 2>&1 || true
             sleep 1
         done
+
         log "Annuncio ARP del VIP inviato."
     else
         log "arping non disponibile: proseguo senza gratuitous ARP."
@@ -248,6 +308,7 @@ cleanup() {
     if [[ "${CLEANUP_DONE}" == "true" ]]; then
         return 0
     fi
+
     CLEANUP_DONE=true
 
     log "Ricevuta richiesta di arresto dell'add-on."
@@ -274,7 +335,8 @@ need grep
 MASTER_NODE_IP="$(opt master_node_ip)"
 VIRTUAL_IP="$(opt virtual_ip)"
 PREFIX_LENGTH="$(opt prefix_length)"
-INTERFACE="$(opt interface)"
+INTERFACE_CONFIG="$(opt interface)"
+DEBUG_LOGGING="$(opt debug_logging)"
 
 CHECK_INTERVAL="$(opt check_interval)"
 PING_TIMEOUT="$(opt ping_timeout)"
@@ -290,14 +352,15 @@ POST_VIP_REMOVE_DELAY="$(opt post_vip_remove_delay)"
 TEST_VIP_ONLY="$(opt test_vip_only)"
 VIP_TEST_DURATION="$(opt vip_test_duration)"
 
-ip link show "${INTERFACE}" >/dev/null 2>&1 \
-    || fail "Interfaccia non trovata: ${INTERFACE}"
+INTERFACE="$(detect_interface)"
 
 trap 'cleanup' EXIT
 trap 'exit 0' INT TERM
 
 log "Add-on operativo avviato."
-log "Interfaccia backup: ${INTERFACE}"
+log "Interfaccia backup rilevata: ${INTERFACE}"
+debug "Configurazione interfaccia: ${INTERFACE_CONFIG}"
+debug "Debug logging attivo."
 log "Master monitorato: ${MASTER_NODE_IP}:8123"
 log "VIP gestito: ${VIRTUAL_IP}/${PREFIX_LENGTH}"
 log "Failover: ${FAILOVER_FAILURES} fallimenti + ${FAILOVER_GRACE_PERIOD}s."
@@ -308,7 +371,8 @@ if is_true "${TEST_VIP_ONLY}"; then
     exit 0
 fi
 
-# Riconciliazione iniziale.
+# Riconciliazione al boot:
+# se il master è sano, il backup deve rilasciare il VIP e fermare Core.
 if master_ok; then
     STATE="STANDBY"
     log "Master sano all'avvio: imposto il Raspberry in STANDBY."
@@ -317,7 +381,7 @@ if master_ok; then
         log "VIP presente sul Raspberry mentre il master è sano: lo rilascio."
         remove_vip || log "ERRORE: impossibile rimuovere il VIP all'avvio."
     else
-        log "VIP già assente sul Raspberry."
+        debug "VIP già assente sul Raspberry."
     fi
 
     if stop_core; then
@@ -334,6 +398,7 @@ elif vip_present; then
         log "Core locale già disponibile."
     else
         log "Core locale non disponibile: provo ad avviarlo."
+
         if start_core; then
             log "Core locale disponibile: failover ripristinato."
         else
@@ -355,7 +420,7 @@ while true; do
             SUCCESSES=0
             log "Core locale ora disponibile: failover completato."
         else
-            log "Failover pending: VIP mantenuto; attendo l'avvio del Core locale."
+            debug "Failover pending: VIP mantenuto; attendo l'avvio del Core locale."
         fi
 
         sleep "${CHECK_INTERVAL}"
@@ -366,11 +431,16 @@ while true; do
         if [[ "${STATE}" == "STANDBY" ]]; then
             FAILURES=0
             SUCCESSES=0
+            debug "Master sano; standby stabile."
         else
             SUCCESSES=$((SUCCESSES + 1))
             FAILURES=0
 
-            log "Master OK | successi failback=${SUCCESSES}/${FAILBACK_SUCCESSES}."
+            if (( SUCCESSES == 1 )); then
+                log "Master nuovamente raggiungibile: inizio conteggio failback."
+            else
+                debug "Master OK | successi failback=${SUCCESSES}/${FAILBACK_SUCCESSES}."
+            fi
 
             if (( SUCCESSES >= FAILBACK_SUCCESSES )); then
                 log "Soglia failback raggiunta; attendo grace period ${FAILBACK_GRACE_PERIOD}s."
@@ -388,12 +458,16 @@ while true; do
         if [[ "${STATE}" == "FAILOVER_ACTIVE" ]]; then
             SUCCESSES=0
             FAILURES=0
-            log "Master KO; mantengo VIP e Core backup attivi."
+            debug "Master KO; mantengo VIP e Core backup attivi."
         else
             FAILURES=$((FAILURES + 1))
             SUCCESSES=0
 
-            log "Master KO | fallimenti failover=${FAILURES}/${FAILOVER_FAILURES}."
+            if (( FAILURES == 1 )); then
+                log "Master non raggiungibile: inizio conteggio failover."
+            else
+                debug "Master KO | fallimenti failover=${FAILURES}/${FAILOVER_FAILURES}."
+            fi
 
             if (( FAILURES >= FAILOVER_FAILURES )); then
                 log "Soglia failover raggiunta; attendo grace period ${FAILOVER_GRACE_PERIOD}s."
