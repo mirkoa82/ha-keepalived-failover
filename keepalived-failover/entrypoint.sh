@@ -163,4 +163,197 @@ stop_core() {
 
     while (( $(date +%s) < deadline )); do
         if ! core_is_running; then
-            log "
+            log "Home Assistant Core locale arrestato."
+            return 0
+        fi
+        sleep 2
+    done
+
+    log "ERRORE: timeout arresto Core (${CORE_STOP_TIMEOUT}s)."
+    return 1
+}
+
+failover() {
+    log "========== INIZIO FAILOVER =========="
+
+    # Il VIP prima: il Core si avvierà già sull'indirizzo usato dai client.
+    if ! add_vip; then
+        log "ERRORE: impossibile aggiungere VIP; failover annullato."
+        return 1
+    fi
+
+    announce_vip
+    sleep "${POST_VIP_ADD_DELAY}"
+
+    if ! start_core; then
+        log "ERRORE: Core non avviato; rimuovo VIP per non lasciare un endpoint non funzionante."
+        remove_vip || true
+        return 1
+    fi
+
+    STATE="FAILOVER_ACTIVE"
+    FAILURES=0
+    SUCCESSES=0
+
+    log "========== FAILOVER COMPLETATO =========="
+    log "VIP ${VIRTUAL_IP} attivo su ${INTERFACE}; Core backup operativo."
+}
+
+failback() {
+    log "========== INIZIO FAILBACK =========="
+    log "Master ${MASTER_NODE_IP} stabile: arresto Core backup e rilascio VIP."
+
+    # Core prima del VIP: riduce la possibilità che due Core servano automazioni.
+    if ! stop_core; then
+        log "ERRORE: Core backup non arrestato; non rimuovo il VIP."
+        return 1
+    fi
+
+    if ! remove_vip; then
+        log "ERRORE: VIP non rimosso; Core backup resta fermo per sicurezza."
+        return 1
+    fi
+
+    sleep "${POST_VIP_REMOVE_DELAY}"
+
+    STATE="STANDBY"
+    FAILURES=0
+    SUCCESSES=0
+
+    log "========== FAILBACK COMPLETATO =========="
+    log "VIP rimosso; Core backup fermo; Raspberry in standby."
+}
+
+test_vip() {
+    log "========== MODALITÀ TEST VIP =========="
+    log "Master e Core non saranno modificati."
+    log "Aggiungo ${VIRTUAL_IP}/${PREFIX_LENGTH} per ${VIP_TEST_DURATION}s, poi lo rimuovo."
+
+    add_vip || fail "Test annullato: impossibile aggiungere VIP."
+    announce_vip
+    sleep "${VIP_TEST_DURATION}"
+    remove_vip || fail "Test fallito: impossibile rimuovere VIP."
+
+    log "========== TEST VIP COMPLETATO CON SUCCESSO =========="
+}
+
+cleanup() {
+    log "Ricevuta richiesta di arresto dell'add-on."
+
+    # Non rimuovere automaticamente il VIP nella modalità operativa:
+    # se il Raspberry sta gestendo il failover, toglierlo al riavvio
+    # dell'add-on renderebbe Home Assistant irraggiungibile.
+    #
+    # Il test VIP invece deve sempre pulire l'indirizzo temporaneo.
+    if [[ "${TEST_VIP_ONLY:-false}" == "true" ]]; then
+        remove_vip || true
+    fi
+}
+
+need curl
+need jq
+need ip
+need ping
+need nc
+need awk
+need grep
+
+[[ -f "${CONFIG}" ]] || fail "File opzioni non trovato: ${CONFIG}"
+[[ -n "${SUPERVISOR_TOKEN:-}" ]] || fail "SUPERVISOR_TOKEN mancante: verifica hassio_api: true."
+
+MASTER_NODE_IP="$(opt master_node_ip)"
+VIRTUAL_IP="$(opt virtual_ip)"
+PREFIX_LENGTH="$(opt prefix_length)"
+INTERFACE="$(opt interface)"
+
+CHECK_INTERVAL="$(opt check_interval)"
+PING_TIMEOUT="$(opt ping_timeout)"
+TCP_TIMEOUT="$(opt tcp_timeout)"
+FAILOVER_FAILURES="$(opt failover_failures)"
+FAILOVER_GRACE_PERIOD="$(opt failover_grace_period)"
+FAILBACK_SUCCESSES="$(opt failback_successes)"
+FAILBACK_GRACE_PERIOD="$(opt failback_grace_period)"
+CORE_START_TIMEOUT="$(opt core_start_timeout)"
+CORE_STOP_TIMEOUT="$(opt core_stop_timeout)"
+POST_VIP_ADD_DELAY="$(opt post_vip_add_delay)"
+POST_VIP_REMOVE_DELAY="$(opt post_vip_remove_delay)"
+TEST_VIP_ONLY="$(opt test_vip_only)"
+VIP_TEST_DURATION="$(opt vip_test_duration)"
+
+ip link show "${INTERFACE}" >/dev/null 2>&1 \
+    || fail "Interfaccia non trovata: ${INTERFACE}"
+
+trap cleanup EXIT INT TERM
+
+log "Add-on operativo avviato."
+log "Interfaccia backup: ${INTERFACE}"
+log "Master monitorato: ${MASTER_NODE_IP}:8123"
+log "VIP gestito: ${VIRTUAL_IP}/${PREFIX_LENGTH}"
+log "Failover: ${FAILOVER_FAILURES} fallimenti + ${FAILOVER_GRACE_PERIOD}s."
+log "Failback: ${FAILBACK_SUCCESSES} successi + ${FAILBACK_GRACE_PERIOD}s."
+
+if is_true "${TEST_VIP_ONLY}"; then
+    test_vip
+    exit 0
+fi
+
+# Se l'add-on viene riavviato durante un failover e trova già il VIP,
+# riprende nello stato attivo invece di rimuoverlo.
+if vip_present; then
+    STATE="FAILOVER_ACTIVE"
+    log "VIP già presente all'avvio: riprendo in FAILOVER_ACTIVE."
+else
+    STATE="STANDBY"
+    log "Nessun VIP presente: avvio in STANDBY."
+fi
+
+while true; do
+    if master_ok; then
+        if [[ "${STATE}" == "STANDBY" ]]; then
+            FAILURES=0
+            SUCCESSES=0
+        else
+            SUCCESSES=$((SUCCESSES + 1))
+            FAILURES=0
+
+            log "Master OK | successi failback=${SUCCESSES}/${FAILBACK_SUCCESSES}."
+
+            if (( SUCCESSES >= FAILBACK_SUCCESSES )); then
+                log "Soglia failback raggiunta; attendo grace period ${FAILBACK_GRACE_PERIOD}s."
+                sleep "${FAILBACK_GRACE_PERIOD}"
+
+                if master_ok; then
+                    failback || true
+                else
+                    log "Master non più disponibile dopo grace period; failback annullato."
+                    SUCCESSES=0
+                fi
+            fi
+        fi
+    else
+        if [[ "${STATE}" == "FAILOVER_ACTIVE" ]]; then
+            SUCCESSES=0
+            FAILURES=0
+            log "Master KO; mantengo VIP e Core backup attivi."
+        else
+            FAILURES=$((FAILURES + 1))
+            SUCCESSES=0
+
+            log "Master KO | fallimenti failover=${FAILURES}/${FAILOVER_FAILURES}."
+
+            if (( FAILURES >= FAILOVER_FAILURES )); then
+                log "Soglia failover raggiunta; attendo grace period ${FAILOVER_GRACE_PERIOD}s."
+                sleep "${FAILOVER_GRACE_PERIOD}"
+
+                if ! master_ok; then
+                    failover || true
+                else
+                    log "Master recuperato durante grace period; failover annullato."
+                    FAILURES=0
+                fi
+            fi
+        fi
+    fi
+
+    sleep "${CHECK_INTERVAL}"
+done
